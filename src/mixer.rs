@@ -5,7 +5,6 @@ use std::sync::{
     atomic::{AtomicU16, Ordering},
 };
 
-#[cfg(test)]
 pub fn percent(volume: u16) -> u16 {
     ((u32::from(volume) * 100 + 32767) / 65535) as u16
 }

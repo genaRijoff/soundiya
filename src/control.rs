@@ -2,11 +2,16 @@
 use crate::{
     bypass::Handle,
     config,
-    mixer::{DeviceMixer, from_percent},
+    mixer::{DeviceMixer, from_percent, percent},
     soundcloud::{Client, clean_token},
     voice::{self, Event, Intent},
 };
-use std::{fs, io, os::unix::fs::PermissionsExt, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    fs, io,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    sync::{Arc, Mutex, atomic::Ordering},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -123,10 +128,9 @@ async fn handle(
             _ => Err("repeat takes on or off".into()),
         },
         "VOLUME" => {
-            let percent: u16 = argument.parse().map_err(|_| "volume is 0-100".to_owned())?;
-            if percent > 100 {
-                return Err("volume is 0-100".into());
-            }
+            let current = percent(context.mixer.desired.load(Ordering::Acquire));
+            let percent = volume_target(argument, current)
+                .ok_or("volume is 0-100, or a step such as +10 or -10")?;
             context.mixer.set(from_percent(percent));
             Ok(format!("volume {percent}%"))
         }
@@ -147,5 +151,33 @@ async fn handle(
             Ok("signed out".into())
         }
         _ => Err("unknown command".into()),
+    }
+}
+
+/// `VOLUME 40` sets 40 %; `VOLUME +10` and `VOLUME -10` step from `current`, within 0-100.
+fn volume_target(argument: &str, current: u16) -> Option<u16> {
+    let step = |n: &str| n.parse::<u16>().ok().filter(|&n| n <= 100);
+    if let Some(n) = argument.strip_prefix('+') {
+        Some((current + step(n)?).min(100))
+    } else if let Some(n) = argument.strip_prefix('-') {
+        Some(current.saturating_sub(step(n)?))
+    } else {
+        step(argument)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_target;
+    #[test]
+    fn volume_takes_a_level_or_a_step() {
+        assert_eq!(volume_target("40", 70), Some(40));
+        assert_eq!(volume_target("+10", 70), Some(80));
+        assert_eq!(volume_target("+10", 95), Some(100));
+        assert_eq!(volume_target("-10", 5), Some(0));
+        assert_eq!(volume_target("-10", 70), Some(60));
+        for bad in ["", "101", "+", "-x", "+200", "ten"] {
+            assert_eq!(volume_target(bad, 50), None, "{bad}");
+        }
     }
 }

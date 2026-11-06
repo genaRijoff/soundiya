@@ -65,7 +65,7 @@ soundiya - SoundCloud for Yandex Stations
   soundiya restart            play the current track from the beginning
   soundiya repeat [on|off]    repeat the current track endlessly
   soundiya sleep MINUTES|off  pause the music after MINUTES (voice: выключись через 30 минут)
-  soundiya volume 0-100
+  soundiya volume 0-100|+N|-N  set the volume, or step it: volume +10
   soundiya status             what is playing now
   soundiya state              the same and the queue, as JSON (for scripts and bots)
   soundiya jump N             play track N of the queue
@@ -332,6 +332,8 @@ struct StateView<'a> {
     repeat: bool,
     sleep: Option<u64>,
     signed_in: bool,
+    /// The volume the listener chose, in percent (Alice may duck it for a moment).
+    volume: u16,
     queue: Vec<Entry<'a>>,
 }
 #[derive(serde::Serialize)]
@@ -462,7 +464,7 @@ impl App {
     }
 
     /// The `STATE` answer, see [`StateView`].
-    fn state_json(&self) -> String {
+    fn state_json(&self, volume: u16) -> String {
         let state = match self.player.state() {
             PLAYING => "playing",
             PAUSED => "paused",
@@ -478,6 +480,7 @@ impl App {
                 .sleep_at
                 .map(|at| at.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
             signed_in: self.client.logged_in(),
+            volume,
             queue: self
                 .queue
                 .iter()
@@ -1003,7 +1006,8 @@ async fn daemon(options: Options) -> Result<(), String> {
                 buttons_active.store(app.active(), Ordering::Release);
                 mixer.follow(state != IDLE || app.active());
                 *context.status.lock().unwrap() = app.status();
-                *context.state.lock().unwrap() = app.state_json();
+                *context.state.lock().unwrap() =
+                    app.state_json(mixer::percent(mixer.desired.load(Ordering::Acquire)));
             }
             _ = terminate.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
@@ -1108,6 +1112,7 @@ mod tests {
             repeat: false,
             sleep: Some(30),
             signed_in: true,
+            volume: 40,
             queue: vec![
                 Entry { id: 1, artist: "A", title: "One", duration: 200 },
                 Entry { id: 2, artist: "B \"q\"", title: "Two\nlines", duration: 0 },
@@ -1117,7 +1122,7 @@ mod tests {
         assert!(!json.contains('\n'));
         assert_eq!(
             json,
-            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"queue":[{"id":1,"artist":"A","title":"One","duration":200},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0}]}"#
+            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"volume":40,"queue":[{"id":1,"artist":"A","title":"One","duration":200},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0}]}"#
         );
     }
     #[test]
