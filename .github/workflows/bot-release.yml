@@ -30,7 +30,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REVISION: ${{ inputs.revision }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: bot-api
           fetch-depth: 0
@@ -65,7 +65,7 @@ jobs:
 
       - name: Cache ARM toolchain
         if: steps.plan.outputs.skip == 'false'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/spotiya
           key: spotiya-${{ hashFiles('.build/scripts/bootstrap-arm.sh') }}
@@ -79,6 +79,8 @@ jobs:
           sudo apt-get install -y -qq libasound2-dev
           channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --target armv7-unknown-linux-gnueabihf
+          # Upstream keeps its scripts without the executable bit; build-arm.sh runs check-arm-abi.sh directly.
+          chmod +x scripts/*.sh
           cargo test --locked --bin soundiya
           sh scripts/bootstrap-arm.sh
           sh scripts/build-arm.sh
