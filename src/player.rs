@@ -15,10 +15,12 @@ use alsa::{
 };
 use bytes::Bytes;
 use std::{
+    fs,
     io::{self, Read, Seek, SeekFrom},
+    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc as std_mpsc,
     },
     time::{Duration, Instant},
@@ -44,6 +46,11 @@ const KEEP_OPEN: Duration = Duration::from_secs(3);
 /// Each track (and playback after a pause) fades in over this many milliseconds, so a start
 /// in the middle of a waveform does not click.
 const FADE_IN_MS: u32 = 20;
+/// Voice messages (`VOICE`): raw signed 16-bit little-endian mono at 16 kHz, at most a minute,
+/// only from this folder; each file is deleted as soon as it is read.
+pub const VOICE_DIR: &str = "/tmp/soundiya-tg-voice";
+pub const VOICE_RATE: u32 = 16_000;
+pub const VOICE_MAX_BYTES: u64 = 60 * VOICE_RATE as u64 * 2;
 
 #[derive(Debug)]
 pub enum Event {
@@ -57,6 +64,8 @@ pub struct Shared {
     pub position_ms: AtomicU64,
     /// The only track generation allowed to keep reading; a newer one aborts blocked reads.
     generation: AtomicU64,
+    /// A voice message is playing (or waits for the audio thread).
+    pub voice: AtomicBool,
 }
 
 enum Command {
@@ -67,6 +76,8 @@ enum Command {
     Pause,
     Resume,
     Stop,
+    /// A voice message, mono samples at `VOICE_RATE`: the music pauses for it and goes on after.
+    Voice(Vec<i16>),
 }
 
 pub struct Player {
@@ -81,6 +92,7 @@ impl Player {
             state: AtomicU8::new(IDLE),
             position_ms: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            voice: AtomicBool::new(false),
         });
         let worker = Worker {
             receiver,
@@ -129,6 +141,78 @@ impl Player {
     pub fn state(&self) -> u8 {
         self.shared.state.load(Ordering::Acquire)
     }
+    /// What the control socket needs to hand voice messages to the audio thread.
+    pub fn voice_handle(&self) -> VoiceHandle {
+        VoiceHandle {
+            commands: self.commands.clone(),
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+pub struct VoiceHandle {
+    commands: std_mpsc::Sender<Command>,
+    shared: Arc<Shared>,
+}
+impl VoiceHandle {
+    /// `VOICE <path>`: reads the file (see `VOICE_DIR`), deletes it and queues it for playing.
+    pub fn play_file(&self, path: &str) -> Result<String, String> {
+        play_file_in(Path::new(VOICE_DIR), path, &self.commands, &self.shared)
+    }
+}
+
+fn play_file_in(
+    dir: &Path,
+    path: &str,
+    commands: &std_mpsc::Sender<Command>,
+    shared: &Shared,
+) -> Result<String, String> {
+    let path = Path::new(path);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // Only plain names in our folder: the file is deleted afterwards, so nothing else may be named.
+    let named_ok = path.parent() == Some(dir)
+        && name.ends_with(".pcm")
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !named_ok {
+        return Err(format!("voice files come from {}/*.pcm", dir.display()));
+    }
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("voice: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("voice: not a regular file".into());
+    }
+    let result = (|| {
+        let size = meta.len();
+        if size == 0 || size % 2 != 0 || size > VOICE_MAX_BYTES {
+            return Err(format!(
+                "voice: {size} bytes; expected s16le mono {VOICE_RATE} Hz, up to {VOICE_MAX_BYTES}"
+            ));
+        }
+        if shared.voice.swap(true, Ordering::AcqRel) {
+            return Err("voice: another message is playing".to_owned());
+        }
+        let samples: Vec<i16> = match fs::read(path) {
+            Ok(bytes) => bytes
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect(),
+            Err(e) => {
+                shared.voice.store(false, Ordering::Release);
+                return Err(format!("voice: {e}"));
+            }
+        };
+        let seconds = samples.len() as f64 / f64::from(VOICE_RATE);
+        if commands.send(Command::Voice(samples)).is_err() {
+            shared.voice.store(false, Ordering::Release);
+            return Err("voice: the player is gone".into());
+        }
+        Ok(format!("voice {seconds:.1} s"))
+    })();
+    // Played or refused, the message does not stay on the speaker.
+    let _ = fs::remove_file(path);
+    result
 }
 
 /// Bytes arriving from the network, presented to the decoder as a plain stream.
@@ -303,6 +387,7 @@ pub async fn probe(http: reqwest::Client, stream: Stream) -> Result<(u32, usize)
         state: AtomicU8::new(IDLE),
         position_ms: AtomicU64::new(0),
         generation: AtomicU64::new(1),
+        voice: AtomicBool::new(false),
     });
     let source = spawn_fetch(http, stream, 1, shared);
     tokio::task::spawn_blocking(move || {
@@ -601,42 +686,136 @@ impl Worker {
     /// Waits for the next track. While the device is open it is kept fed with silence for
     /// up to `KEEP_OPEN`, then drained and closed. `None` once the player is gone.
     fn between_tracks(&self, output: &mut Option<Output>) -> Option<(u64, ChannelSource, u64)> {
-        let since = Instant::now();
-        while let Some(out) = output.as_mut() {
-            match self.receiver.try_recv() {
-                Ok(Command::Play(g, s, from)) => return Some((g, s, from)),
-                Ok(Command::Stop) => *output = None,
-                Ok(_) | Err(std_mpsc::TryRecvError::Empty) => {
-                    if since.elapsed() >= KEEP_OPEN {
-                        let _ = out.pcm.drain();
-                        *output = None;
-                    // Blocks while the buffer is full, which paces this loop.
-                    } else if out.write(&vec![0; (out.rate / 100) as usize * CHANNELS]).is_err() {
-                        *output = None;
-                    }
-                }
-                Err(std_mpsc::TryRecvError::Disconnected) => return None,
-            }
-        }
         loop {
-            match self.receiver.recv() {
-                Ok(Command::Play(g, s, from)) => return Some((g, s, from)),
-                Ok(_) => {}
-                Err(_) => return None,
+            let mut since = Instant::now();
+            while output.is_some() {
+                match self.receiver.try_recv() {
+                    Ok(Command::Play(g, s, from)) => return Some((g, s, from)),
+                    Ok(Command::Stop) => *output = None,
+                    Ok(Command::Voice(samples)) => {
+                        match self.voice(samples, output) {
+                            Some(Command::Play(g, s, from)) => return Some((g, s, from)),
+                            Some(Command::Stop) => *output = None,
+                            _ => {}
+                        }
+                        since = Instant::now();
+                    }
+                    Ok(_) | Err(std_mpsc::TryRecvError::Empty) => {
+                        let out = output.as_mut().unwrap();
+                        if since.elapsed() >= KEEP_OPEN {
+                            let _ = out.pcm.drain();
+                            *output = None;
+                        // Blocks while the buffer is full, which paces this loop.
+                        } else if out
+                            .write(&vec![0; (out.rate / 100) as usize * CHANNELS])
+                            .is_err()
+                        {
+                            *output = None;
+                        }
+                    }
+                    Err(std_mpsc::TryRecvError::Disconnected) => return None,
+                }
+            }
+            loop {
+                match self.receiver.recv() {
+                    Ok(Command::Play(g, s, from)) => return Some((g, s, from)),
+                    // Opens the device for the message; the loop above then keeps it open a
+                    // moment and drains it, so the end of the message is heard.
+                    Ok(Command::Voice(samples)) => match self.voice(samples, output) {
+                        Some(Command::Play(g, s, from)) => return Some((g, s, from)),
+                        Some(Command::Stop) => *output = None,
+                        _ => break,
+                    },
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
             }
         }
     }
 
+    /// Plays a voice message through the device, opening it if needed. Stops early for the
+    /// command that cuts it short (stop, another track, pause) and returns that command; resume,
+    /// skips and another message meanwhile are dropped. The track position is left unchanged.
+    fn voice(&self, samples: Vec<i16>, output: &mut Option<Output>) -> Option<Command> {
+        let result = (|| -> Result<Option<Command>, String> {
+            if output.is_none() {
+                *output = Some(Output::open(&self.device, VOICE_RATE)?);
+            }
+            let out = output.as_mut().unwrap();
+            let frames_before = out.frames;
+            let mut resampler =
+                (out.rate != VOICE_RATE).then(|| Resampler::new(VOICE_RATE, out.rate));
+            let mut fade = FadeIn::new();
+            let (mut stereo, mut resampled) = (Vec::new(), Vec::new());
+            let mut cut = None;
+            // A tenth of a second at a time, so a stop or a pause is not kept waiting.
+            for chunk in samples.chunks(VOICE_RATE as usize / 10) {
+                match self.receiver.try_recv() {
+                    Ok(c @ (Command::Stop | Command::Play(..) | Command::Pause)) => {
+                        cut = Some(c);
+                        break;
+                    }
+                    Ok(_) | Err(std_mpsc::TryRecvError::Empty) => {}
+                    Err(std_mpsc::TryRecvError::Disconnected) => {
+                        cut = Some(Command::Stop);
+                        break;
+                    }
+                }
+                to_stereo(chunk, 1, &mut stereo);
+                let data: &mut [i16] = match resampler.as_mut() {
+                    Some(r) => {
+                        resampled.clear();
+                        r.process(&stereo, &mut resampled);
+                        &mut resampled
+                    }
+                    None => &mut stereo,
+                };
+                fade.apply(data, out.rate);
+                out.write(data)?;
+            }
+            if cut.is_some() {
+                let _ = out.pcm.drop();
+                let _ = out.pcm.prepare();
+            }
+            out.frames = frames_before;
+            Ok(cut)
+        })();
+        self.shared.voice.store(false, Ordering::Release);
+        result.unwrap_or_else(|e| {
+            eprintln!("voice: {e}");
+            *output = None;
+            None
+        })
+    }
+
     /// Waits out a pause; returns what to do next if playback does not simply continue.
-    fn paused(&self, output: &Option<Output>, skip_us: &mut u64) -> Option<Outcome> {
-        if let Some(out) = output {
+    fn paused(&self, output: &mut Option<Output>, skip_us: &mut u64) -> Option<Outcome> {
+        if let Some(out) = output.as_ref() {
             let _ = out.pcm.drop();
         }
         self.shared.state.store(PAUSED, Ordering::Release);
         loop {
-            match self.receiver.recv() {
+            let mut command = self.receiver.recv();
+            if let Ok(Command::Voice(samples)) = command {
+                if let Some(out) = output.as_ref() {
+                    let _ = out.pcm.prepare();
+                }
+                let cut = self.voice(samples, output);
+                // The music stays paused: let the end of the message play, then stop the device.
+                if let Some(out) = output.as_ref() {
+                    if cut.is_none() {
+                        let _ = out.pcm.drain();
+                    }
+                    let _ = out.pcm.drop();
+                }
+                match cut {
+                    Some(c) => command = Ok(c),
+                    None => continue,
+                }
+            }
+            match command {
                 Ok(Command::Resume) => {
-                    if let Some(out) = output {
+                    if let Some(out) = output.as_ref() {
                         let _ = out.pcm.prepare();
                     }
                     self.shared.state.store(PLAYING, Ordering::Release);
@@ -645,7 +824,7 @@ impl Worker {
                 Ok(Command::Play(g, s, from)) => return Some(Outcome::Replace(g, s, from)),
                 Ok(Command::Skip(ms)) => *skip_us += ms * 1000,
                 Ok(Command::Stop) | Err(_) => return Some(Outcome::Stopped),
-                Ok(Command::Pause) => {}
+                Ok(Command::Pause | Command::Voice(_)) => {}
             }
         }
     }
@@ -671,7 +850,19 @@ impl Worker {
         let mut resampled: Vec<i16> = Vec::new();
         let mut samples: Option<SampleBuffer<i16>> = None;
         loop {
-            match self.receiver.try_recv() {
+            let mut command = self.receiver.try_recv();
+            if let Ok(Command::Voice(samples)) = command {
+                // The music stops at once (as for a pause) and goes on after the message.
+                if let Some(out) = output.as_ref() {
+                    let _ = out.pcm.drop();
+                    let _ = out.pcm.prepare();
+                }
+                command = self
+                    .voice(samples, output)
+                    .ok_or(std_mpsc::TryRecvError::Empty);
+                fade = FadeIn::new();
+            }
+            match command {
                 Ok(Command::Stop) => return Ok(Outcome::Stopped),
                 Ok(Command::Play(g, s, from)) => return Ok(Outcome::Replace(g, s, from)),
                 Ok(Command::Skip(ms)) => skip_us += ms * 1000,
@@ -681,7 +872,7 @@ impl Worker {
                     }
                     fade = FadeIn::new();
                 }
-                Ok(Command::Resume) | Err(std_mpsc::TryRecvError::Empty) => {}
+                Ok(Command::Resume | Command::Voice(_)) | Err(std_mpsc::TryRecvError::Empty) => {}
                 Err(std_mpsc::TryRecvError::Disconnected) => return Ok(Outcome::Stopped),
             }
             let Some(packet) = demux.next()? else {
@@ -773,6 +964,63 @@ mod tests {
         let total: u64 = (0..frames).map(|_| frames_to_us(1024, 44_100)).sum();
         assert!(20_000_000 - total < 24_000, "{total}");
         assert_eq!(frames_to_us(1, 0), 1_000_000);
+    }
+    #[test]
+    fn voice_files_come_only_from_their_folder_and_are_deleted() {
+        let dir = std::env::temp_dir().join(format!("soundiya-voice-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shared = Shared {
+            state: AtomicU8::new(IDLE),
+            position_ms: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            voice: AtomicBool::new(false),
+        };
+        let (commands, receiver) = std_mpsc::channel();
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let play = |path: &str| play_file_in(&dir, path, &commands, &shared);
+
+        // Outside the folder, odd names and links are refused and left alone.
+        let outside = std::env::temp_dir().join(format!("soundiya-outside-{}.pcm", std::process::id()));
+        fs::write(&outside, [0u8; 4]).unwrap();
+        assert!(play(outside.to_str().unwrap()).is_err());
+        assert!(outside.exists());
+        let link = dir.join("link.pcm");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(play(link.to_str().unwrap()).is_err());
+        assert!(outside.exists());
+        let _ = fs::remove_file(&link);
+        fs::remove_file(&outside).unwrap();
+        for name in ["x.wav", ".x.pcm", "a b.pcm"] {
+            let path = file(name, &[0, 0]);
+            assert!(play(&path).is_err(), "{name}");
+            let _ = fs::remove_file(&path);
+        }
+        assert!(play(&format!("{}/../x.pcm", dir.display())).is_err());
+
+        // Wrong sizes are refused, and the file still goes.
+        let odd = file("odd.pcm", &[1, 2, 3]);
+        assert!(play(&odd).is_err());
+        assert!(!Path::new(&odd).exists());
+        assert!(!shared.voice.load(Ordering::Acquire));
+
+        // A good one: samples to the player, file deleted, busy until the player is done.
+        let good = file("v1.pcm", &[1, 0, 0xff, 0xff, 0, 0x80]);
+        assert_eq!(play(&good).unwrap(), "voice 0.0 s");
+        assert!(!Path::new(&good).exists());
+        match receiver.try_recv() {
+            Ok(Command::Voice(samples)) => assert_eq!(samples, [1, -1, i16::MIN]),
+            _ => panic!("no voice command"),
+        }
+        let second = file("v2.pcm", &[0, 0]);
+        assert!(play(&second).unwrap_err().contains("another message"));
+        assert!(!Path::new(&second).exists());
+        shared.voice.store(false, Ordering::Release);
+        let _ = fs::remove_dir_all(&dir);
     }
     #[test]
     fn channel_layouts_become_stereo() {
