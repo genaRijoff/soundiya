@@ -705,8 +705,12 @@ impl Worker {
                 samples.get_or_insert_with(|| SampleBuffer::new(decoded.capacity() as u64, spec));
             buffer.copy_interleaved_ref(decoded);
             to_stereo(buffer.samples(), spec.channels.count().max(1), &mut stereo);
-            if output.as_ref().is_some_and(|o| o.track_rate != spec.rate) {
-                *output = None; // another rate: reopen
+            // Another rate: keep the open device (closing and reopening it clicks on Mini 1)
+            // and convert this track to the device's rate instead.
+            if let Some(o) = output.as_mut().filter(|o| o.track_rate != spec.rate) {
+                eprintln!("player: track at {} Hz, device stays at {} Hz", spec.rate, o.rate);
+                o.track_rate = spec.rate;
+                o.resampler = (o.rate != spec.rate).then(|| Resampler::new(spec.rate, o.rate));
             }
             if output.is_none() {
                 *output = Some(Output::open(&self.device, spec.rate)?);
