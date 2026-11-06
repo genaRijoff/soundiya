@@ -334,6 +334,8 @@ struct StateView<'a> {
     signed_in: bool,
     /// The volume the listener chose, in percent (Alice may duck it for a moment).
     volume: u16,
+    /// A voice message (`VOICE`) is playing.
+    voice: bool,
     queue: Vec<Entry<'a>>,
 }
 #[derive(serde::Serialize)]
@@ -481,6 +483,7 @@ impl App {
                 .map(|at| at.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
             signed_in: self.client.logged_in(),
             volume,
+            voice: self.player.shared.voice.load(Ordering::Acquire),
             queue: self
                 .queue
                 .iter()
@@ -948,6 +951,7 @@ async fn daemon(options: Options) -> Result<(), String> {
         mixer: mixer.clone(),
         bypass: bypass_handle.clone(),
         state_dir: options.state_dir.clone(),
+        voice: player.voice_handle(),
     });
     tokio::spawn({
         let context = context.clone();
@@ -1113,6 +1117,7 @@ mod tests {
             sleep: Some(30),
             signed_in: true,
             volume: 40,
+            voice: false,
             queue: vec![
                 Entry { id: 1, artist: "A", title: "One", duration: 200 },
                 Entry { id: 2, artist: "B \"q\"", title: "Two\nlines", duration: 0 },
@@ -1122,7 +1127,7 @@ mod tests {
         assert!(!json.contains('\n'));
         assert_eq!(
             json,
-            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"volume":40,"queue":[{"id":1,"artist":"A","title":"One","duration":200},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0}]}"#
+            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"volume":40,"voice":false,"queue":[{"id":1,"artist":"A","title":"One","duration":200},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0}]}"#
         );
     }
     #[test]

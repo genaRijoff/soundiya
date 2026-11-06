@@ -3,6 +3,7 @@ use crate::{
     bypass::Handle,
     config,
     mixer::{DeviceMixer, from_percent, percent},
+    player::VoiceHandle,
     soundcloud::{Client, clean_token},
     voice::{self, Event, Intent},
 };
@@ -28,6 +29,8 @@ pub struct Context {
     /// The running bypass proxy, whose strategy can be switched on the fly.
     pub bypass: Handle,
     pub state_dir: PathBuf,
+    /// Voice messages go straight to the audio thread (`VOICE <path>`).
+    pub voice: VoiceHandle,
 }
 
 pub async fn serve(sender: mpsc::Sender<Event>, context: Arc<Context>) -> io::Result<()> {
@@ -111,6 +114,8 @@ async fn handle(
             send(sender, Intent::Seek(seconds))
         }
         "RESTART" => send(sender, Intent::Restart),
+        "VOICE" if !argument.is_empty() => context.voice.play_file(argument),
+        "VOICE" => Err("voice takes a file path".into()),
         "JUMP" => match argument.parse::<usize>() {
             Ok(n) if n >= 1 => send(sender, Intent::Jump(n - 1)),
             _ => Err("jump takes a queue position: 1, 2, ...".into()),
