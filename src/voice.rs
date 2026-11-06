@@ -39,6 +39,8 @@ pub enum Intent {
     SleepIn(u32),
     /// Forget the pending `SleepIn`.
     CancelSleep,
+    /// Play this entry of the current queue (0-based); console only.
+    Jump(usize),
 }
 pub struct Event {
     pub intent: Intent,

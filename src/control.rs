@@ -17,6 +17,8 @@ use tokio::{
 pub struct Context {
     pub client: Arc<Client>,
     pub status: Mutex<String>,
+    /// The `STATE` answer: the same as `status`, plus the queue, as one line of JSON.
+    pub state: Mutex<String>,
     pub mixer: Arc<DeviceMixer>,
     /// The running bypass proxy, whose strategy can be switched on the fly.
     pub bypass: Handle,
@@ -72,6 +74,7 @@ async fn handle(
     let argument = argument.trim();
     match command.to_ascii_uppercase().as_str() {
         "STATUS" => Ok(context.status.lock().unwrap().clone()),
+        "STATE" => Ok(context.state.lock().unwrap().clone()),
         "STRATEGY" if argument.is_empty() => Ok(context.bypass.strategy()),
         "STRATEGY" => {
             // Switch first (it validates the name), then remember the choice for the next start.
@@ -103,6 +106,10 @@ async fn handle(
             send(sender, Intent::Seek(seconds))
         }
         "RESTART" => send(sender, Intent::Restart),
+        "JUMP" => match argument.parse::<usize>() {
+            Ok(n) if n >= 1 => send(sender, Intent::Jump(n - 1)),
+            _ => Err("jump takes a queue position: 1, 2, ...".into()),
+        },
         "SLEEP" => match argument.to_ascii_lowercase().as_str() {
             "off" | "cancel" => send(sender, Intent::CancelSleep),
             minutes => match minutes.parse::<u32>() {

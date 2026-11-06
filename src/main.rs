@@ -67,6 +67,8 @@ soundiya - SoundCloud for Yandex Stations
   soundiya sleep MINUTES|off  pause the music after MINUTES (voice: выключись через 30 минут)
   soundiya volume 0-100
   soundiya status             what is playing now
+  soundiya state              the same and the queue, as JSON (for scripts and bots)
+  soundiya jump N             play track N of the queue
   soundiya check              test SoundCloud access and the DPI bypass
   soundiya strategies         list the bypass strategies (Flowseal presets and built-in tricks)
   soundiya strategy NAME      choose one (alt11, general, simple-fake, split, auto, off, ...)
@@ -146,6 +148,8 @@ fn main() -> ExitCode {
         "sleep" => command_line("SLEEP", &rest),
         "volume" => command_line("VOLUME", &rest),
         "status" => command_line("STATUS", ""),
+        "state" => command_line("STATE", ""),
+        "jump" => command_line("JUMP", &rest),
         "logout" => command_line("LOGOUT", ""),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
@@ -317,6 +321,27 @@ fn unreachable_service(from_voice: bool) -> Option<String> {
     from_voice.then(|| "Не получилось связаться с Саундклауд".to_owned())
 }
 
+/// What `soundiya state` prints: one line of JSON for scripts and bots.
+/// `index` counts from 1 and is 0 when nothing of ours plays; times are in seconds;
+/// `sleep` is the minutes left on the sleep timer.
+#[derive(serde::Serialize)]
+struct StateView<'a> {
+    state: &'static str,
+    index: usize,
+    position: u64,
+    repeat: bool,
+    sleep: Option<u64>,
+    signed_in: bool,
+    queue: Vec<Entry<'a>>,
+}
+#[derive(serde::Serialize)]
+struct Entry<'a> {
+    id: u64,
+    artist: &'a str,
+    title: &'a str,
+    duration: u64,
+}
+
 struct App {
     client: Arc<Client>,
     player: Arc<Player>,
@@ -434,6 +459,37 @@ impl App {
             .sleep_at
             .map(|at| format!(" | sleep in {} min", at.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)))
             .unwrap_or_default()
+    }
+
+    /// The `STATE` answer, see [`StateView`].
+    fn state_json(&self) -> String {
+        let state = match self.player.state() {
+            PLAYING => "playing",
+            PAUSED => "paused",
+            _ if self.active() => "loading",
+            _ => "idle",
+        };
+        let view = StateView {
+            state,
+            index: if self.active() { self.index + 1 } else { 0 },
+            position: self.player.shared.position_ms.load(Ordering::Relaxed) / 1000,
+            repeat: self.repeat,
+            sleep: self
+                .sleep_at
+                .map(|at| at.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)),
+            signed_in: self.client.logged_in(),
+            queue: self
+                .queue
+                .iter()
+                .map(|t| Entry {
+                    id: t.id,
+                    artist: &t.artist,
+                    title: &t.title,
+                    duration: t.duration_ms / 1000,
+                })
+                .collect(),
+        };
+        serde_json::to_string(&view).unwrap_or_default()
     }
 
     fn stop(&mut self) {
@@ -721,6 +777,10 @@ impl App {
                 self.silence(from_voice);
                 self.start_at(self.index, 0);
             }
+            Intent::Jump(index) if index < self.queue.len() => {
+                self.silence(from_voice);
+                self.start(index);
+            }
             Intent::Loop(on) if self.active() || !on => {
                 self.silence(from_voice);
                 self.repeat = on && self.active();
@@ -767,7 +827,8 @@ impl App {
             | Intent::Restart
             | Intent::Loop(_)
             | Intent::SleepIn(_)
-            | Intent::CancelSleep => {}
+            | Intent::CancelSleep
+            | Intent::Jump(_) => {}
         }
     }
 
@@ -880,6 +941,7 @@ async fn daemon(options: Options) -> Result<(), String> {
     let context = Arc::new(control::Context {
         client: client.clone(),
         status: Mutex::new(String::new()),
+        state: Mutex::new(String::new()),
         mixer: mixer.clone(),
         bypass: bypass_handle.clone(),
         state_dir: options.state_dir.clone(),
@@ -941,6 +1003,7 @@ async fn daemon(options: Options) -> Result<(), String> {
                 buttons_active.store(app.active(), Ordering::Release);
                 mixer.follow(state != IDLE || app.active());
                 *context.status.lock().unwrap() = app.status();
+                *context.state.lock().unwrap() = app.state_json();
             }
             _ = terminate.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
@@ -1035,7 +1098,28 @@ async fn check(options: Options) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_link;
+    use super::{Entry, StateView, is_link};
+    #[test]
+    fn state_is_one_line_of_json() {
+        let view = StateView {
+            state: "playing",
+            index: 2,
+            position: 61,
+            repeat: false,
+            sleep: Some(30),
+            signed_in: true,
+            queue: vec![
+                Entry { id: 1, artist: "A", title: "One", duration: 200 },
+                Entry { id: 2, artist: "B \"q\"", title: "Two\nlines", duration: 0 },
+            ],
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains('\n'));
+        assert_eq!(
+            json,
+            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"queue":[{"id":1,"artist":"A","title":"One","duration":200},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0}]}"#
+        );
+    }
     #[test]
     fn recognizes_soundcloud_links_only() {
         assert!(is_link("https://soundcloud.com/artist/sets/mix"));
