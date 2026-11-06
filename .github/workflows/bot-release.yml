@@ -1,0 +1,107 @@
+# Every 6 hours: when ShadowBlade83/soundiya publishes a new release, put the patches of this
+# branch (bot-api) on top of it, run the tests, build ARMv7 and publish release <tag>-bot with the
+# same files as the upstream release (soundiya-tg installs them). A patch that no longer applies
+# or a failing test stops the run: no release, GitHub mails the failure.
+name: bot release
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Rebuild the same upstream release as <tag>-bot.N (N = 2, 3, ...); empty: normal check'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bot-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      UPSTREAM: ShadowBlade83/soundiya
+      GH_TOKEN: ${{ github.token }}
+      REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bot-api
+          fetch-depth: 0
+
+      - name: Check upstream
+        id: plan
+        run: |
+          set -euo pipefail
+          up=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          [[ $up =~ ^v[0-9]+(\.[0-9]+){1,3}$ ]] || { echo "::error::unexpected upstream tag: $up"; exit 1; }
+          [[ -z $REVISION || $REVISION =~ ^[0-9]{1,3}$ ]] || { echo "::error::revision must be a number"; exit 1; }
+          tag="$up-bot${REVISION:+.$REVISION}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag is already released"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag exists without a release: delete the tag or run with a revision"
+            exit 1
+          fi
+          { echo "skip=false"; echo "up=$up"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+
+      - name: Apply patches
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          UP: ${{ steps.plan.outputs.up }}
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          bash .github/bot-release.sh "https://github.com/$UPSTREAM.git" "$UP" .build
+
+      - name: Cache ARM toolchain
+        if: steps.plan.outputs.skip == 'false'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/spotiya
+          key: spotiya-${{ hashFiles('.build/scripts/bootstrap-arm.sh') }}
+
+      - name: Test and build
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: .build
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --target armv7-unknown-linux-gnueabihf
+          cargo test --locked --bin soundiya
+          sh scripts/bootstrap-arm.sh
+          sh scripts/build-arm.sh
+          sh scripts/package.sh
+
+      - name: Publish
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: .build
+        env:
+          UP: ${{ steps.plan.outputs.up }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          patches=$(git log --reverse --format='- %s' "refs/upstream/$UP..HEAD")
+          git tag -a "$TAG" -m "soundiya $UP + bot-api patches"
+          git push origin "refs/tags/$TAG"
+          cp dist/soundiya-armv7.tar.gz "dist/soundiya-mini1-bot-$TAG.tar.gz"
+          notes="Upstream [$UP](https://github.com/$UPSTREAM/releases/tag/$UP) with the patches for [soundiya-tg](https://github.com/${GITHUB_REPOSITORY_OWNER}/soundiya-tg):
+          $patches
+
+          Install: the button in soundiya-tg, or the archive with install-soundiya-build.ps1. The files match the upstream release layout."
+          cd dist/soundiya-armv7
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "$TAG" --notes "$notes" \
+            SHA256SUMS soundiya install.sh run.sh start.sh stop.sh S99soundiya \
+            "../soundiya-mini1-bot-$TAG.tar.gz"
