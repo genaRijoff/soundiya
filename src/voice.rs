@@ -41,6 +41,9 @@ pub enum Intent {
     CancelSleep,
     /// Play this entry of the current queue (0-based); console only.
     Jump(usize),
+    /// "передай Маше, что я буду через час": the rest of the phrase as said, for the
+    /// Telegram bot (see `mailbox`); Alice keeps it when no bot collects.
+    Message(String),
 }
 pub struct Event {
     pub intent: Intent,
@@ -360,7 +363,79 @@ const VERBS: &[&str] = &[
 /// Verbs that Alice also uses for things that are not music.
 const SOFT_VERBS: &[&str] = &["найди", "найти", "поищи", "покажи", "заведи"];
 
+/// Words that may come before "передай" or between it and the name.
+const MESSAGE_FILLER: &[&str] = &[
+    "алиса",
+    "а",
+    "ну",
+    "слушай",
+    "пожалуйста",
+    "можешь",
+    "давай",
+];
+/// Longest first: "отправь голосовое сообщение" before "отправь голосовое".
+const MESSAGE_TRIGGERS: &[&[&str]] = &[
+    &["отправь", "голосовое", "сообщение"],
+    &["отправь", "голосовое"],
+    &["отправь", "сообщение"],
+    &["напиши", "сообщение"],
+    &["передайте"],
+    &["передай"],
+];
+
+/// "Алиса, передай пожалуйста Маше, что я буду через час" -> "Маше, что я буду через час":
+/// the rest of the phrase exactly as recognized, at least a name and a word.
+pub fn message(text: &str) -> Option<String> {
+    let mut words: Vec<(usize, &str)> = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                words.push((s, &text[s..i]));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        words.push((s, &text[s..]));
+    }
+    let plain: Vec<String> = words
+        .iter()
+        .map(|(_, w)| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+                .replace('ё', "е")
+        })
+        .collect();
+    let skip = |mut i: usize| {
+        while plain
+            .get(i)
+            .is_some_and(|w| MESSAGE_FILLER.contains(&w.as_str()))
+        {
+            i += 1;
+        }
+        i
+    };
+    let at = skip(0);
+    let trigger = MESSAGE_TRIGGERS.iter().find(|t| {
+        t.iter()
+            .enumerate()
+            .all(|(k, word)| plain.get(at + k).is_some_and(|w| w == word))
+    })?;
+    let first = skip(at + trigger.len());
+    if words.len() < first + 2 {
+        return None;
+    }
+    let rest =
+        text[words[first].0..].trim_end_matches(|c: char| c.is_whitespace() || ".!?".contains(c));
+    Some(rest.to_owned())
+}
+
 pub fn intent(text: &str) -> Option<Intent> {
+    if let Some(rest) = message(text) {
+        return Some(Intent::Message(rest));
+    }
     let text = normalize(text);
     if text.is_empty() || LIKES.contains(&text.as_str()) {
         return None;
@@ -891,6 +966,45 @@ mod tests {
             assert!(!native_volume_request(text), "{text}");
         }
     }
+    #[test]
+    fn messages_for_the_bot_keep_the_words_as_said() {
+        let cases = [
+            (
+                "Передай Маше, что я буду через час.",
+                Some("Маше, что я буду через час"),
+            ),
+            (
+                "Алиса, передай пожалуйста Машуле привет",
+                Some("Машуле привет"),
+            ),
+            (
+                "отправь голосовое сообщение маме: купи хлеб",
+                Some("маме: купи хлеб"),
+            ),
+            (
+                "Отправь голосовое Саше ёлка готова",
+                Some("Саше ёлка готова"),
+            ),
+            ("а можешь отправить сообщение маме", None),
+            ("отправь сообщение маме", None),
+            ("передай привет", None),
+            ("включи передай привет", None),
+            ("включи Radiohead", None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(message(text).as_deref(), want, "{text}");
+        }
+        assert_eq!(
+            intent("Передай Маше привет"),
+            Some(Intent::Message("Маше привет".into()))
+        );
+        // Not taken from music: "включи передай привет" is still a search.
+        assert!(matches!(
+            intent("включи передай привет"),
+            Some(Intent::Play(_))
+        ));
+    }
+
     #[test]
     fn recognizes_music_commands_and_leaves_household_commands_alone() {
         assert_eq!(
