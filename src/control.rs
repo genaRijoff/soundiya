@@ -31,6 +31,31 @@ pub struct Context {
     pub state_dir: PathBuf,
     /// Voice messages go straight to the audio thread (`VOICE <path>`).
     pub voice: VoiceHandle,
+    /// "передай …" phrases waiting for the Telegram bot (`MESSAGES`).
+    pub mailbox: Arc<crate::mailbox::Mailbox>,
+    /// Where Alice reads `SAY` text aloud; None when speech is off.
+    pub speaker: Option<std::net::SocketAddr>,
+    pub guard: Arc<crate::audio_guard::AudioGuard>,
+}
+
+/// `SAY <text>`: Alice reads a short answer aloud, after her own answer was cancelled.
+fn say(context: &Context, text: &str) -> Result<String, String> {
+    let address = context.speaker.ok_or("speech is off")?;
+    if text.chars().count() > 300 {
+        return Err("say takes up to 300 characters".into());
+    }
+    let (text, guard) = (text.to_owned(), context.guard.clone());
+    // Keeps the music guard from pausing the station's player (and her voice) meanwhile.
+    guard.hold(std::time::Duration::from_secs(20));
+    tokio::spawn(async move {
+        tokio::time::sleep(voice::CANCELS_DONE).await;
+        match voice::say(address, &text).await {
+            Ok(()) => eprintln!("say: '{text}'"),
+            Err(e) => eprintln!("say: {e}"),
+        }
+        guard.release();
+    });
+    Ok("say".into())
 }
 
 pub async fn serve(sender: mpsc::Sender<Event>, context: Arc<Context>) -> io::Result<()> {
@@ -116,6 +141,9 @@ async fn handle(
         "RESTART" => send(sender, Intent::Restart),
         "VOICE" if !argument.is_empty() => context.voice.play_file(argument),
         "VOICE" => Err("voice takes a file path".into()),
+        "MESSAGES" => Ok(context.mailbox.collect()),
+        "SAY" if !argument.is_empty() => say(context, argument),
+        "SAY" => Err("say takes the text".into()),
         "JUMP" => match argument.parse::<usize>() {
             Ok(n) if n >= 1 => send(sender, Intent::Jump(n - 1)),
             _ => Err("jump takes a queue position: 1, 2, ...".into()),
