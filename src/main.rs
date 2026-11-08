@@ -6,6 +6,7 @@ mod diagnose;
 mod ducking;
 mod fmp4;
 mod buttons;
+mod mailbox;
 mod mixer;
 mod player;
 mod rawfake;
@@ -352,6 +353,8 @@ struct App {
     guard: Arc<audio_guard::AudioGuard>,
     native: Option<SocketAddr>,
     messages: mpsc::UnboundedSender<Message>,
+    /// "передай …" phrases for the Telegram bot.
+    mailbox: Arc<mailbox::Mailbox>,
     state_dir: PathBuf,
     queue: Vec<Track>,
     index: usize,
@@ -691,6 +694,14 @@ impl App {
 
     fn intent(&mut self, event: voice::Event) {
         let from_voice = event.from_voice;
+        // Whoever plays (Alice's player included), a message changes nothing in the music.
+        if let Intent::Message(text) = &event.intent {
+            if self.mailbox.push(text) {
+                self.silence(from_voice);
+                eprintln!("voice: message for the bot");
+            }
+            return;
+        }
         if self.handed_over {
             if from_voice || matches!(event.intent, Intent::Toggle) {
                 match event.intent {
@@ -834,7 +845,8 @@ impl App {
             | Intent::Loop(_)
             | Intent::SleepIn(_)
             | Intent::CancelSleep
-            | Intent::Jump(_) => {}
+            | Intent::Jump(_)
+            | Intent::Message(_) => {}
         }
     }
 
@@ -944,6 +956,7 @@ async fn daemon(options: Options) -> Result<(), String> {
         buttons::spawn(sender.clone(), buttons_active.clone());
     }
 
+    let mailbox = Arc::new(mailbox::Mailbox::default());
     let context = Arc::new(control::Context {
         client: client.clone(),
         status: Mutex::new(String::new()),
@@ -952,6 +965,9 @@ async fn daemon(options: Options) -> Result<(), String> {
         bypass: bypass_handle.clone(),
         state_dir: options.state_dir.clone(),
         voice: player.voice_handle(),
+        mailbox: mailbox.clone(),
+        speaker: native.filter(|_| config.speech),
+        guard: guard.clone(),
     });
     tokio::spawn({
         let context = context.clone();
@@ -969,6 +985,7 @@ async fn daemon(options: Options) -> Result<(), String> {
         guard,
         native,
         messages,
+        mailbox,
         state_dir: options.state_dir.clone(),
         queue: Vec::new(),
         index: 0,
