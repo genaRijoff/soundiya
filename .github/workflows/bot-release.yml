@@ -75,8 +75,15 @@ jobs:
         working-directory: .build
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libasound2-dev
+          # GitHub's own Ubuntu mirror (azure.archive.ubuntu.com) sometimes does not resolve for
+          # hours: then Ubuntu's main archive is used instead.
+          for try in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev; then break; fi
+            echo "apt failed (try $try); using archive.ubuntu.com"
+            echo "http://archive.ubuntu.com/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            sleep 10
+          done
+          dpkg -s libasound2-dev >/dev/null
           channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --target armv7-unknown-linux-gnueabihf
           # Upstream keeps its scripts without the executable bit; build-arm.sh runs check-arm-abi.sh directly.
