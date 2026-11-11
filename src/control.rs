@@ -4,7 +4,7 @@ use crate::{
     config,
     mixer::{DeviceMixer, from_percent, percent},
     player::VoiceHandle,
-    soundcloud::{Client, clean_token},
+    soundcloud::{Client, Track, clean_token},
     voice::{self, Event, Intent},
 };
 use std::{
@@ -36,6 +36,57 @@ pub struct Context {
     /// Where Alice reads `SAY` text aloud; None when speech is off.
     pub speaker: Option<std::net::SocketAddr>,
     pub guard: Arc<crate::audio_guard::AudioGuard>,
+}
+
+/// One track of a listing (`FIND`, `LIKES`, `SIMILAR`, `CHART`): what the bot's panel shows.
+#[derive(serde::Serialize)]
+struct Listed<'a> {
+    id: u64,
+    artist: &'a str,
+    title: &'a str,
+    duration: u64,
+    art: &'a str,
+    url: &'a str,
+}
+
+/// Tracks as one line of JSON; nothing is played.
+fn listing(tracks: &[Track]) -> String {
+    let listed: Vec<Listed> = tracks
+        .iter()
+        .map(|t| Listed {
+            id: t.id,
+            artist: &t.artist,
+            title: &t.title,
+            duration: t.duration_ms / 1000,
+            art: &t.art,
+            url: &t.url,
+        })
+        .collect();
+    serde_json::to_string(&listed).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The most `PLAYIDS` takes at once.
+const MAX_IDS: usize = 100;
+
+/// `PLAYIDS 11,22,33`: SoundCloud track ids, in the order to play them.
+fn track_ids(argument: &str) -> Result<Vec<u64>, String> {
+    let ids: Vec<u64> = argument
+        .split(',')
+        .map(|id| id.trim().parse::<u64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| "playids takes track ids: 11,22,33".to_owned())?;
+    if ids.is_empty() || ids.len() > MAX_IDS {
+        return Err(format!("playids takes 1 to {MAX_IDS} track ids"));
+    }
+    Ok(ids)
+}
+
+fn signed_in(context: &Context) -> Result<(), String> {
+    if context.client.logged_in() {
+        Ok(())
+    } else {
+        Err("not signed in: run 'soundiya login'".into())
+    }
 }
 
 /// `SAY <text>`: Alice reads a short answer aloud, after her own answer was cancelled.
@@ -126,6 +177,48 @@ async fn handle(
             send(sender, Intent::Chart { trending: command.eq_ignore_ascii_case("TRENDING"), genre })
         }
         "RELATED" => send(sender, Intent::Related),
+        // Listings for the bot's panel: they only answer, nothing starts playing.
+        "FIND" if !argument.is_empty() => {
+            let tracks = if crate::is_link(argument) {
+                context.client.link(argument, 100).await?.1
+            } else {
+                context.client.search(argument, 30).await?
+            };
+            Ok(listing(&tracks))
+        }
+        "FIND" => Err("missing search query".into()),
+        "LIKES" => {
+            signed_in(context)?;
+            Ok(listing(&context.client.liked_tracks(100).await?))
+        }
+        "SIMILAR" => {
+            let id: u64 = argument
+                .parse()
+                .map_err(|_| "similar takes a track id".to_owned())?;
+            Ok(listing(&context.client.related(id, 30).await?))
+        }
+        "CHART" => {
+            let (kind, genre) = argument.split_once(' ').unwrap_or((argument, ""));
+            let trending = match kind.to_ascii_lowercase().as_str() {
+                "" | "trending" => true,
+                "top" => false,
+                _ => return Err("chart takes top or trending, then a genre".into()),
+            };
+            let genre = voice::genre_of(&genre.to_lowercase()).unwrap_or("all-music");
+            Ok(listing(&context.client.chart(trending, genre, 30).await?))
+        }
+        "PLAYLISTS" => {
+            signed_in(context)?;
+            let playlists = context.client.my_playlists(50).await?;
+            Ok(serde_json::to_string(&playlists).unwrap_or_else(|_| "[]".to_owned()))
+        }
+        "PLAYIDS" => send(sender, Intent::Tracks(track_ids(argument)?)),
+        "OPENPL" => {
+            let id: u64 = argument
+                .parse()
+                .map_err(|_| "openpl takes a playlist id".to_owned())?;
+            send(sender, Intent::PlaylistId(id))
+        }
         "NOW" => send(sender, Intent::NowPlaying),
         "PAUSE" => send(sender, Intent::Pause),
         "RESUME" => send(sender, Intent::Resume),
@@ -201,7 +294,17 @@ fn volume_target(argument: &str, current: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::volume_target;
+    use super::{track_ids, volume_target};
+    #[test]
+    fn playids_takes_a_bounded_list_of_numbers() {
+        assert_eq!(track_ids("11, 22,33"), Ok(vec![11, 22, 33]));
+        assert_eq!(track_ids("7"), Ok(vec![7]));
+        for bad in ["", "1,,2", "1,x", "-1", "1 2"] {
+            assert!(track_ids(bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (1..=101).map(|n| n.to_string()).collect();
+        assert!(track_ids(&many.join(",")).is_err());
+    }
     #[test]
     fn volume_takes_a_level_or_a_step() {
         assert_eq!(volume_target("40", 70), Some(40));

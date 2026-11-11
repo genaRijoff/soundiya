@@ -57,6 +57,10 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub duration_ms: u64,
+    /// The cover (or the artist's picture), as SoundCloud gives it; may be empty.
+    pub art: String,
+    /// The track's soundcloud.com page; may be empty.
+    pub url: String,
     authorization: String,
     transcodings: Vec<Transcoding>,
 }
@@ -71,6 +75,16 @@ pub struct Stream {
     /// An HLS playlist of segments rather than one continuous file.
     pub hls: bool,
     pub codec: Codec,
+}
+
+/// One of the signed-in user's playlists or albums (`PLAYLISTS`).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Playlist {
+    pub id: u64,
+    pub title: String,
+    pub count: u64,
+    pub art: String,
+    pub user: String,
 }
 
 pub struct Client {
@@ -397,8 +411,54 @@ impl Client {
         Ok(tracks.into_iter().flatten().collect())
     }
 
+    /// Tracks by id, in this order; unknown and unplayable ones are left out.
+    pub async fn tracks(&self, ids: &[u64]) -> Res<Vec<Track>> {
+        let items: Vec<Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect();
+        let items: Vec<&Value> = items.iter().collect();
+        self.complete(&items).await
+    }
+
+    /// The signed-in user's own and liked playlists and albums (empty ones left out).
+    pub async fn my_playlists(&self, limit: usize) -> Res<Vec<Playlist>> {
+        let user = self.me().await?;
+        let limit = limit.to_string();
+        let value = self
+            .call(
+                reqwest::Method::GET,
+                &format!("{API}/users/{user}/playlists/liked_and_owned"),
+                &[("limit", &limit)],
+            )
+            .await?;
+        Ok(value["collection"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let p = if item["playlist"].is_object() {
+                    &item["playlist"]
+                } else {
+                    item
+                };
+                Some(Playlist {
+                    id: p["id"].as_u64()?,
+                    title: p["title"].as_str().unwrap_or_default().to_owned(),
+                    count: p["track_count"].as_u64().unwrap_or(0),
+                    art: p["artwork_url"].as_str().unwrap_or_default().to_owned(),
+                    user: p["user"]["username"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+            })
+            .filter(|p| p.count > 0)
+            .collect())
+    }
+
     /// The tracks of one playlist or album, at most `limit` of them.
-    async fn playlist_tracks(&self, id: u64, limit: usize) -> Res<Vec<Track>> {
+    pub async fn playlist_tracks(&self, id: u64, limit: usize) -> Res<Vec<Track>> {
         let value = self.call(reqwest::Method::GET, &format!("{API}/playlists/{id}"), &[]).await?;
         let items: Vec<&Value> = value["tracks"].as_array().into_iter().flatten().take(limit).collect();
         self.complete(&items).await
@@ -618,6 +678,12 @@ fn parse_track(v: &Value) -> Option<Track> {
             .as_u64()
             .or_else(|| v["duration"].as_u64())
             .unwrap_or(0),
+        art: v["artwork_url"]
+            .as_str()
+            .or_else(|| v["user"]["avatar_url"].as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        url: v["permalink_url"].as_str().unwrap_or_default().to_owned(),
         authorization: v["track_authorization"].as_str().unwrap_or_default().to_owned(),
         transcodings,
     })
@@ -702,6 +768,26 @@ mod tests {
         assert_eq!(clean_token(&format!("{jwt} {classic}")).as_deref(), Some(classic));
     }
     #[test]
+    fn tracks_keep_their_cover_or_the_artist_picture_and_page() {
+        let media = r#""media":{"transcodings":[{"url":"https://x/p","preset":"mp3_1_0","format":{"protocol":"progressive","mime_type":"audio/mpeg"}}]}"#;
+        let with_cover: Value = serde_json::from_str(&format!(
+            r#"{{"id":1,"title":"A","user":{{"username":"U","avatar_url":"https://i1.sndcdn.com/avatars-1-large.jpg"}},
+                "artwork_url":"https://i1.sndcdn.com/artworks-1-large.jpg","permalink_url":"https://soundcloud.com/u/a",{media}}}"#
+        ))
+        .unwrap();
+        let track = parse_track(&with_cover).unwrap();
+        assert_eq!(track.art, "https://i1.sndcdn.com/artworks-1-large.jpg");
+        assert_eq!(track.url, "https://soundcloud.com/u/a");
+        let without: Value = serde_json::from_str(&format!(
+            r#"{{"id":2,"title":"B","user":{{"username":"U","avatar_url":"https://i1.sndcdn.com/avatars-1-large.jpg"}},"artwork_url":null,{media}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            parse_track(&without).unwrap().art,
+            "https://i1.sndcdn.com/avatars-1-large.jpg"
+        );
+    }
+    #[test]
     fn parses_tracks_with_mp3_transcodings() {
         let value: Value = serde_json::from_str(
             r#"{"id":7,"title":"Song","user":{"username":"Band"},"duration":1000,
@@ -715,6 +801,8 @@ mod tests {
         .unwrap();
         let track = parse_track(&value).unwrap();
         assert_eq!(track.label(), "Band - Song");
+        // No cover and no page in this answer: empty, not made up.
+        assert_eq!((track.art.as_str(), track.url.as_str()), ("", ""));
         assert_eq!(track.transcodings.len(), 5);
         // AAC 160k beats AAC 96k beats MP3; adaptive and Opus streams cannot be played.
         let mut ranked: Vec<_> = track
