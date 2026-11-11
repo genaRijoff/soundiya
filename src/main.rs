@@ -306,6 +306,10 @@ enum Fetch {
     Related(u64),
     /// A soundcloud.com link to a track, playlist or artist.
     Link(String),
+    /// Tracks by id, in this order (the bot's panel).
+    Ids(Vec<u64>),
+    /// A playlist or album by id.
+    PlaylistId(u64),
 }
 
 fn is_link(text: &str) -> bool {
@@ -345,6 +349,10 @@ struct Entry<'a> {
     artist: &'a str,
     title: &'a str,
     duration: u64,
+    /// The cover's address (SoundCloud's CDN), or "".
+    art: &'a str,
+    /// The track's soundcloud.com page, or "".
+    url: &'a str,
 }
 
 struct App {
@@ -495,6 +503,8 @@ impl App {
                     artist: &t.artist,
                     title: &t.title,
                     duration: t.duration_ms / 1000,
+                    art: &t.art,
+                    url: &t.url,
                 })
                 .collect(),
         };
@@ -612,6 +622,8 @@ impl App {
                     _ => client.chart(trending, "all-music", 50).await,
                 },
                 Fetch::Related(track) => client.related(track, 50).await,
+                Fetch::Ids(ids) => client.tracks(&ids).await,
+                Fetch::PlaylistId(id) => client.playlist_tracks(id, 100).await,
                 Fetch::Link(url) => client.link(&url, 100).await.map(|(title, tracks)| {
                     eprintln!("link: {title} ({} tracks)", tracks.len());
                     tracks
@@ -739,6 +751,8 @@ impl App {
             Intent::Play(query) => self.search(query, from_voice),
             Intent::Favorites => self.favorites(from_voice),
             Intent::Playlist(name) => self.load(Fetch::Playlist(name), from_voice),
+            Intent::Tracks(ids) => self.load(Fetch::Ids(ids), from_voice),
+            Intent::PlaylistId(id) => self.load(Fetch::PlaylistId(id), from_voice),
             Intent::Chart { trending, genre } => self.load(Fetch::Chart { trending, genre }, from_voice),
             Intent::Related if self.active() => {
                 if let Some(track) = self.queue.get(self.index) {
@@ -1136,15 +1150,29 @@ mod tests {
             volume: 40,
             voice: false,
             queue: vec![
-                Entry { id: 1, artist: "A", title: "One", duration: 200 },
-                Entry { id: 2, artist: "B \"q\"", title: "Two\nlines", duration: 0 },
+                Entry {
+                    id: 1,
+                    artist: "A",
+                    title: "One",
+                    duration: 200,
+                    art: "https://i1.sndcdn.com/a.jpg",
+                    url: "",
+                },
+                Entry {
+                    id: 2,
+                    artist: "B \"q\"",
+                    title: "Two\nlines",
+                    duration: 0,
+                    art: "",
+                    url: "",
+                },
             ],
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains('\n'));
         assert_eq!(
             json,
-            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"volume":40,"voice":false,"queue":[{"id":1,"artist":"A","title":"One","duration":200},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0}]}"#
+            r#"{"state":"playing","index":2,"position":61,"repeat":false,"sleep":30,"signed_in":true,"volume":40,"voice":false,"queue":[{"id":1,"artist":"A","title":"One","duration":200,"art":"https://i1.sndcdn.com/a.jpg","url":""},{"id":2,"artist":"B \"q\"","title":"Two\nlines","duration":0,"art":"","url":""}]}"#
         );
     }
     #[test]
