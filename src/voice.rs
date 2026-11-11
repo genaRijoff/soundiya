@@ -41,6 +41,10 @@ pub enum Intent {
     CancelSleep,
     /// Play this entry of the current queue (0-based); console only.
     Jump(usize),
+    /// Play these tracks (SoundCloud ids) in this order; console only (the bot's panel).
+    Tracks(Vec<u64>),
+    /// Play the playlist or album with this id; console only.
+    PlaylistId(u64),
     /// "передай Маше, что я буду через час": the rest of the phrase as said, for the
     /// Telegram bot (see `mailbox`); Alice keeps it when no bot collects.
     Message(String),
