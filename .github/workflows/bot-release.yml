@@ -73,6 +73,9 @@ jobs:
       - name: Test and build
         if: steps.plan.outputs.skip == 'false'
         working-directory: .build
+        env:
+          # `soundiya version` names the release it was built as.
+          SOUNDIYA_RELEASE: ${{ steps.plan.outputs.tag }}
         run: |
           set -euo pipefail
           # GitHub's own Ubuntu mirror (azure.archive.ubuntu.com) sometimes does not resolve for
