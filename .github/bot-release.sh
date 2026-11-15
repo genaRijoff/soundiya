@@ -18,17 +18,26 @@ git worktree add --quiet --detach "$work" "$upc"
 cd "$work"
 for c in "${patches[@]}"; do
     subject=$(git log -1 --format=%s "$c")
-    if git cherry-pick -x "$c" >/dev/null 2>&1; then
-        echo "applied: $subject"
-    elif git diff --quiet && git diff --cached --quiet; then
-        # Nothing left to change: upstream already has this patch.
-        git cherry-pick --skip
-        echo "already upstream: $subject"
-    else
+    git cherry-pick --no-commit "$c" >/dev/null 2>&1 || true
+    # A commit that also changed a workflow file: only its other files are carried over
+    # (the worktree is a throwaway checkout of the upstream tag, cleaned here).
+    git reset --quiet HEAD -- .github 2>/dev/null || true
+    git checkout --quiet HEAD -- .github 2>/dev/null || true
+    git clean -fdq -- .github
+    if [[ -n $(git diff --name-only --diff-filter=U) ]]; then
         git diff --name-only --diff-filter=U | sed 's/^/conflict: /' >&2
-        git cherry-pick --abort
         echo "patch does not apply on $up: $subject" >&2
         exit 1
+    fi
+    git cherry-pick --quit 2>/dev/null || true
+    if git diff --cached --quiet; then
+        # Nothing left to change: upstream already has this patch.
+        git reset --quiet --hard HEAD
+        echo "already upstream: $subject"
+    else
+        git commit --quiet --no-verify -C "$c"
+        git commit --quiet --amend --no-verify -m "$(git log -1 --format=%B "$c")" -m "(cherry picked from commit $c)"
+        echo "applied: $subject"
     fi
 done
 
