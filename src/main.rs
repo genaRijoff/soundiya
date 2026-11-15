@@ -156,11 +156,25 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             Ok(())
         }
+        "version" | "--version" | "-V" => {
+            println!("{}", version_line(option_env!("SOUNDIYA_RELEASE")));
+            Ok(())
+        }
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
+    }
+}
+
+/// `soundiya version`: the package version and, when the build says so, the release it is
+/// (`SOUNDIYA_RELEASE` at build time, e.g. "v0.1.10-bot.5").
+fn version_line(release: Option<&str>) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match release.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(release) => format!("soundiya {version} ({release})"),
+        None => format!("soundiya {version}"),
     }
 }
 
@@ -1137,6 +1151,17 @@ async fn check(options: Options) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_version_names_the_release_when_the_build_knows_it() {
+        let plain = format!("soundiya {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(super::version_line(None), plain);
+        assert_eq!(super::version_line(Some(" ")), plain);
+        assert_eq!(
+            super::version_line(Some("v0.1.10-bot.5")),
+            format!("{plain} (v0.1.10-bot.5)")
+        );
+    }
+
     use super::{Entry, StateView, is_link};
     #[test]
     fn state_is_one_line_of_json() {
